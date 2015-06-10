@@ -144,16 +144,6 @@ static int
 rspamd_poller_handle_testpoller (struct rspamd_http_connection_entry *conn_ent,
 	struct rspamd_http_message *msg)
 {
-	struct rspamd_poller_session *session = conn_ent->ud;
-	ucl_object_t *top;
-
-	top = ucl_object_typed_new (UCL_OBJECT);
-
-	ucl_object_insert_key (top,
-			ucl_object_fromint (777), "test poller", 0, false);
-
-	rspamd_controller_send_ucl (conn_ent, top);
-	ucl_object_unref (top);
 
 	return 0;
 }
