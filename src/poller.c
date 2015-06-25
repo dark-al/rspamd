@@ -25,11 +25,15 @@
 #include "utlist.h"
 #include "main.h"
 #include "libutil/map.h"
+#include "xxhash.h"
+#include <archive.h>
+#include <archive_entry.h>
 
 /* 60 seconds for worker's IO */
 #define DEFAULT_WORKER_IO_TIMEOUT 60000
 
-#define PATH_TESTPOLLER "/testpoller"
+#define PATH_ARCHIVEINFO "/archiveinfo"
+#define PATH_EXTRACTFILES "/extractfiles"
 
 /* Init functions */
 gpointer init_poller_worker (struct rspamd_config *cfg);
@@ -137,13 +141,131 @@ rspamd_poller_accept_socket (gint fd, short what, void *arg)
 
 /*
  * Stat command handler:
- * request: /testpoller
+ * request: /archiveinfo
  * reply: json data
  */
 static int
-rspamd_poller_handle_testpoller (struct rspamd_http_connection_entry *conn_ent,
+rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	struct rspamd_http_message *msg)
 {
+	struct archive *archive;
+	struct archive_entry *entry;
+	int r;
+	unsigned int errors = 0, hash, offset;
+	size_t size;
+	const char *pathname = NULL;
+	void *buff;
+	ucl_object_t *top, *sub, *obj;
+
+	top = ucl_object_typed_new (UCL_ARRAY);
+	sub = ucl_object_typed_new (UCL_ARRAY);
+
+	archive = archive_read_new ();
+	archive_read_support_filter_all (archive);
+	archive_read_support_format_all (archive);
+
+	r = archive_read_open_memory (archive, msg->body->str, msg->body->len);
+
+	if (r != ARCHIVE_OK) {
+		msg_err ("Invalid archive");
+		rspamd_controller_send_error (conn_ent, 500, "Invalid archive");
+	}
+
+	while (r != ARCHIVE_EOF) {
+		r = archive_read_next_header (archive, &entry);
+
+		switch (r) {
+			case ARCHIVE_OK:
+			case ARCHIVE_WARN: {
+				offset += size;
+				size = archive_entry_size (entry);
+				pathname = archive_entry_pathname (entry);
+				buff = g_malloc (size);
+
+				archive_read_data (archive, buff, size);
+				hash = XXH32 (buff, size, 0);
+
+				obj = ucl_object_typed_new (UCL_OBJECT);
+				ucl_object_insert_key (obj, ucl_object_fromstring (pathname), "pathname", 0, false);
+				ucl_object_insert_key (obj, ucl_object_fromint (size), "size", 0, false);
+				ucl_object_insert_key (obj, ucl_object_fromint (hash), "hash", 0, false);
+				ucl_object_insert_key (obj, ucl_object_fromint (offset), "offset", 0, false);
+				ucl_array_append (sub, obj);
+
+				g_free (buff);
+			}
+			case ARCHIVE_FAILED: {
+				errors++;
+				msg_err (archive_error_string (archive));
+			}
+		}
+	}
+
+	obj = ucl_object_typed_new (UCL_OBJECT);
+	ucl_object_insert_key (obj, ucl_object_fromint (errors), "errors", 0, false);
+	ucl_array_append (top, obj);
+	/* check if ucl array has objects */
+	//ucl_array_append (top, sub);
+
+	rspamd_controller_send_ucl (conn_ent, top);
+
+	ucl_object_unref (top);
+	archive_read_free (archive);
+
+	return 0;
+}
+
+/*
+ * Stat command handler:
+ * request: /extractfiles
+ * reply: json data
+ */
+static int
+rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent,
+	struct rspamd_http_message *msg)
+{
+	struct archive *archive;
+	struct archive_entry *entry;
+	int r;
+	unsigned int hash;
+	size_t size;
+	const char *pathname = NULL;
+	void *buff;
+	ucl_object_t *top, *obj;
+
+	top = ucl_object_typed_new (UCL_ARRAY);
+
+	archive = archive_read_new ();
+	archive_read_support_filter_all (archive);
+	archive_read_support_format_all (archive);
+
+	r = archive_read_open_memory (archive, msg->body->str, msg->body->len);
+
+	if (r != ARCHIVE_OK) {
+		msg_err ("Invalid archive");
+		rspamd_controller_send_error (conn_ent, 500, "Invalid archive");
+	}
+
+	while (archive_read_next_header (archive, &entry) == ARCHIVE_OK) {
+		size = archive_entry_size (entry);
+		pathname = archive_entry_pathname (entry);
+		buff = malloc (size);
+		archive_read_data (archive, buff, size);
+		hash = XXH32 (buff, size, 0);
+
+		obj = ucl_object_typed_new (UCL_OBJECT);
+		ucl_object_insert_key (obj, ucl_object_fromstring (pathname), "pathname", 0, false);
+		ucl_object_insert_key (obj, ucl_object_fromint (size), "size", 0, false);
+		ucl_object_insert_key (obj, ucl_object_fromint (hash), "hash", 0, false);
+		ucl_array_append (top, obj);
+
+		free (buff);
+	}
+
+	rspamd_controller_send_ucl (conn_ent, top);
+
+	ucl_object_unref (top);
+	archive_read_free (archive);
 
 	return 0;
 }
@@ -154,7 +276,7 @@ init_poller_worker (struct rspamd_config *cfg)
 	struct rspamd_poller_worker_ctx *ctx;
 	//GQuark type;
 
-  /* FIXME: use type */
+	/* FIXME: use type */
 	//type = g_quark_try_string ("poller");
 
 	ctx = g_malloc0 (sizeof (struct rspamd_poller_worker_ctx));
@@ -174,12 +296,12 @@ start_poller_worker (struct rspamd_worker *worker)
 	struct rspamd_keypair_cache *cache;
 
 	ctx->ev_base = rspamd_prepare_worker (worker, "poller", rspamd_poller_accept_socket);
-  msec_to_tv (ctx->timeout, &ctx->io_tv);
+	msec_to_tv (ctx->timeout, &ctx->io_tv);
 
-  ctx->start_time = time (NULL);
-  ctx->worker = worker;
-  ctx->cfg = worker->srv->cfg;
-  ctx->srv = worker->srv;
+	ctx->start_time = time (NULL);
+	ctx->worker = worker;
+	ctx->cfg = worker->srv->cfg;
+	ctx->srv = worker->srv;
 
 	/* Accept event */
 	cache = rspamd_keypair_cache_new (256);
@@ -188,9 +310,12 @@ start_poller_worker (struct rspamd_worker *worker)
 			ctx->static_files_dir, cache);
 
 	/* Add callbacks for different methods */
-  rspamd_http_router_add_path (ctx->http,
-				PATH_TESTPOLLER,
-		rspamd_poller_handle_testpoller);
+	rspamd_http_router_add_path (ctx->http,
+				PATH_ARCHIVEINFO,
+		rspamd_poller_handle_archiveinfo);
+	rspamd_http_router_add_path (ctx->http,
+				PATH_EXTRACTFILES,
+		rspamd_poller_handle_extractfiles);
 
 	if (ctx->key) {
 		rspamd_http_router_set_key (ctx->http, ctx->key);
