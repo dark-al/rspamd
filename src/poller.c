@@ -151,10 +151,10 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	struct archive *archive;
 	struct archive_entry *entry;
 	int r;
-	unsigned int errors = 0, hash, offset;
-	size_t size;
+	unsigned int errors = 0, hash = 0, offset = 0;
+	size_t size = 0;
 	const char *pathname = NULL;
-	void *buff;
+	void *buff = NULL;
 	ucl_object_t *top, *sub, *obj;
 
 	top = ucl_object_typed_new (UCL_ARRAY);
@@ -174,15 +174,22 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	while (r != ARCHIVE_EOF) {
 		r = archive_read_next_header (archive, &entry);
 
-		switch (r) {
-			case ARCHIVE_OK:
-			case ARCHIVE_WARN: {
-				offset += size;
-				size = archive_entry_size (entry);
-				pathname = archive_entry_pathname (entry);
-				buff = g_malloc (size);
+		if (r == ARCHIVE_OK) {
+			offset += size;
+			size = archive_entry_size (entry);
+			buff = g_malloc0 (size);
 
-				archive_read_data (archive, buff, size);
+			if (buff != NULL) {
+				r = archive_read_data (archive, buff, size);
+				if (r > 0) {
+					r = ARCHIVE_OK;
+				}
+			}
+		}
+
+		switch (r) {
+			case ARCHIVE_OK: {
+				pathname = archive_entry_pathname (entry);
 				hash = XXH32 (buff, size, 0);
 
 				obj = ucl_object_typed_new (UCL_OBJECT);
@@ -191,21 +198,26 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 				ucl_object_insert_key (obj, ucl_object_fromint (hash), "hash", 0, false);
 				ucl_object_insert_key (obj, ucl_object_fromint (offset), "offset", 0, false);
 				ucl_array_append (sub, obj);
-
-				g_free (buff);
-			}
-			case ARCHIVE_FAILED: {
+			} break;
+			case ARCHIVE_WARN:
+			case ARCHIVE_FAILED:
+			case ARCHIVE_FATAL: {
 				errors++;
 				msg_err (archive_error_string (archive));
-			}
+			} break;
 		}
+
+		//if (buff != NULL) {
+		//	g_free (buff);
+		//}
 	}
 
 	obj = ucl_object_typed_new (UCL_OBJECT);
 	ucl_object_insert_key (obj, ucl_object_fromint (errors), "errors", 0, false);
 	ucl_array_append (top, obj);
-	/* check if ucl array has objects */
-	//ucl_array_append (top, sub);
+	if (ucl_array_head (sub)) {
+		ucl_array_append (top, sub);
+	}
 
 	rspamd_controller_send_ucl (conn_ent, top);
 
