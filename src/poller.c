@@ -150,10 +150,12 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 {
 	struct archive *archive;
 	struct archive_entry *entry;
+	struct rspamd_http_header *header;
 	int r;
-	unsigned int errors = 0, hash = 0, offset = 0;
+	unsigned int errors = 0, hash = 0, offset = 0, maxsize = 0;
 	size_t size = 0;
 	const char *pathname = NULL;
+	gchar *header_name, *header_value;
 	void *buff = NULL;
 	ucl_object_t *top, *sub, *obj;
 
@@ -171,14 +173,29 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 		rspamd_controller_send_error (conn_ent, 500, "Invalid archive");
 	}
 
+	header = msg->headers;
+	while (header) {
+		header_name = g_strndup (header->name->str, header->name->len);
+		header_value = g_strndup (header->value->str, header->value->len);
+
+		if (g_strcmp0 (header_name, "X-MAXFILE-SIZE") == 0) {
+			maxsize = g_ascii_strtoll (header_value, NULL, 10);
+		}
+		header = header->next;
+	}
+
 	r = archive_read_next_header (archive, &entry);
 	while (r != ARCHIVE_EOF) {
 		switch (r) {
 			case ARCHIVE_OK: {
 				offset += size;
 				size = archive_entry_size (entry);
-				buff = g_malloc0 (size);
-				r = archive_read_data (archive, buff, size);
+				if (size <= maxsize) {
+					buff = g_malloc0 (size);
+					r = archive_read_data (archive, buff, size);
+				} else {
+					r = archive_read_next_header (archive, &entry);
+				}
 			} break;
 			case ARCHIVE_WARN:
 			case ARCHIVE_FAILED:
