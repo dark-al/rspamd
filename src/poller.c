@@ -155,7 +155,7 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	unsigned int errors = 0, hash = 0, offset = 0, maxsize = 0;
 	size_t size = 0;
 	const char *pathname = NULL;
-	gchar *header_name, *header_value;
+	gchar *header_name, *header_value, *archive_name = NULL;
 	void *buff = NULL;
 	ucl_object_t *top, *sub, *obj;
 
@@ -178,7 +178,10 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 		header_name = g_strndup (header->name->str, header->name->len);
 		header_value = g_strndup (header->value->str, header->value->len);
 
-		if (g_strcmp0 (header_name, "X-MAXFILE-SIZE") == 0) {
+		if (g_strcmp0 (header_name, "X-ARCHIVE-NAME") == 0) {
+			archive_name = header_value;
+		}
+		else if (g_strcmp0 (header_name, "X-MAXFILE-SIZE") == 0) {
 			maxsize = g_ascii_strtoll (header_value, NULL, 10);
 		}
 		header = header->next;
@@ -227,6 +230,13 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	obj = ucl_object_typed_new (UCL_OBJECT);
 	ucl_object_insert_key (obj, ucl_object_fromint (errors), "errors", 0, false);
 	ucl_array_append (top, obj);
+
+	if (archive_name) {
+		obj = ucl_object_typed_new (UCL_OBJECT);
+		ucl_object_insert_key (obj, ucl_object_fromstring (archive_name), "name", 0, false);
+		ucl_array_append (top, obj);
+	}
+
 	if (ucl_array_head (sub)) {
 		ucl_array_append (top, sub);
 	}
