@@ -171,24 +171,23 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 		rspamd_controller_send_error (conn_ent, 500, "Invalid archive");
 	}
 
+	r = archive_read_next_header (archive, &entry);
 	while (r != ARCHIVE_EOF) {
-		r = archive_read_next_header (archive, &entry);
-
-		if (r == ARCHIVE_OK) {
-			offset += size;
-			size = archive_entry_size (entry);
-			buff = g_malloc0 (size);
-
-			if (buff != NULL) {
-				r = archive_read_data (archive, buff, size);
-				if (r > 0) {
-					r = ARCHIVE_OK;
-				}
-			}
-		}
-
 		switch (r) {
 			case ARCHIVE_OK: {
+				offset += size;
+				size = archive_entry_size (entry);
+				buff = g_malloc0 (size);
+				r = archive_read_data (archive, buff, size);
+			} break;
+			case ARCHIVE_WARN:
+			case ARCHIVE_FAILED:
+			case ARCHIVE_FATAL: {
+				errors++;
+				msg_err (archive_error_string (archive));
+				r = archive_read_next_header (archive, &entry);
+			} break;
+			default: {
 				pathname = archive_entry_pathname (entry);
 				hash = XXH32 (buff, size, 0);
 
@@ -198,18 +197,14 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 				ucl_object_insert_key (obj, ucl_object_fromint (hash), "hash", 0, false);
 				ucl_object_insert_key (obj, ucl_object_fromint (offset), "offset", 0, false);
 				ucl_array_append (sub, obj);
-			} break;
-			case ARCHIVE_WARN:
-			case ARCHIVE_FAILED:
-			case ARCHIVE_FATAL: {
-				errors++;
-				msg_err (archive_error_string (archive));
+
+				r = archive_read_next_header (archive, &entry);
+
+				if (buff) {
+					g_free (buff);
+				}
 			} break;
 		}
-
-		//if (buff != NULL) {
-		//	g_free (buff);
-		//}
 	}
 
 	obj = ucl_object_typed_new (UCL_OBJECT);
