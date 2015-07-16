@@ -155,7 +155,8 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	unsigned int errors = 0, hash = 0, offset = 0, maxsize = 0;
 	size_t size = 0;
 	const char *pathname = NULL;
-	gchar *header_name, *header_value, *archive_name = NULL;
+	gchar *header_name, *header_value, *archive_name = NULL, **filter_mask = NULL;
+	gboolean match_mask;
 	void *buff = NULL;
 	ucl_object_t *top, *sub, *obj;
 
@@ -180,9 +181,10 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 
 		if (g_strcmp0 (header_name, "X-ARCHIVE-NAME") == 0) {
 			archive_name = header_value;
-		}
-		else if (g_strcmp0 (header_name, "X-MAXFILE-SIZE") == 0) {
+		} else if (g_strcmp0 (header_name, "X-MAXFILE-SIZE") == 0) {
 			maxsize = g_ascii_strtoll (header_value, NULL, 10);
+		} else if (g_strcmp0 (header_name, "X-FILTER-MASK") == 0) {
+			filter_mask = g_strsplit_set (header_value, " ,", -1);
 		}
 		header = header->next;
 	}
@@ -193,11 +195,21 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 			case ARCHIVE_OK: {
 				offset += size;
 				size = archive_entry_size (entry);
-				if (size <= maxsize) {
+				pathname = archive_entry_pathname (entry);
+
+				for (guint i = 0; i < g_strv_length (filter_mask); i++) {
+					if (match_mask == FALSE) {
+						match_mask = g_pattern_match_simple (filter_mask[i], pathname);
+					} else {
+						break;
+					}
+				}
+
+				if (match_mask == FALSE || (maxsize > 0 && size > maxsize)) {
+					r = archive_read_next_header (archive, &entry);
+				} else {
 					buff = g_malloc0 (size);
 					r = archive_read_data (archive, buff, size);
-				} else {
-					r = archive_read_next_header (archive, &entry);
 				}
 			} break;
 			case ARCHIVE_WARN:
@@ -208,7 +220,6 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 				r = archive_read_next_header (archive, &entry);
 			} break;
 			default: {
-				pathname = archive_entry_pathname (entry);
 				hash = XXH32 (buff, size, 0);
 
 				obj = ucl_object_typed_new (UCL_OBJECT);
