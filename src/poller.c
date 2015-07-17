@@ -212,7 +212,7 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 				size = archive_entry_size (entry);
 				pathname = archive_entry_pathname (entry);
 
-				if (size > 0) {
+				if (archive_entry_filetype (entry) == AE_IFREG) {
 					curfile++;
 
 					for (guint i = 0; i < g_strv_length (filter_mask); i++) {
