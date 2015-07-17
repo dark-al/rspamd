@@ -148,45 +148,60 @@ static int
 rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	struct rspamd_http_message *msg)
 {
-	struct archive *archive;
-	struct archive_entry *entry;
-	struct rspamd_http_header *header;
+	struct archive *archive = NULL;
+	struct archive_entry *entry = NULL;
+	struct rspamd_http_header *header = NULL;
 	int r;
-	unsigned int errors = 0, hash = 0, offset = 0, maxsize = 0;
+	unsigned int errors = 0, hash = 0, offset = 0, maxsize = 0, curfile = 0, maxfiles = 0;
 	size_t size = 0;
 	const char *pathname = NULL;
-	gchar *header_name, *header_value, *archive_name = NULL, **filter_mask = NULL;
-	gboolean match_mask;
-	void *buff = NULL;
+	gchar *header_name = NULL, *header_value = NULL, *archive_name = NULL, **filter_mask = NULL;
+	gboolean match_mask = FALSE;
+	void *buffer = NULL;
 	ucl_object_t *top, *sub, *obj;
 
 	top = ucl_object_typed_new (UCL_ARRAY);
 	sub = ucl_object_typed_new (UCL_ARRAY);
 
 	archive = archive_read_new ();
-	archive_read_support_filter_all (archive);
-	archive_read_support_format_all (archive);
 
-	r = archive_read_open_memory (archive, msg->body->str, msg->body->len);
+	if (archive != NULL) {
+		archive_read_support_filter_all (archive);
+		archive_read_support_format_all (archive);
+		r = archive_read_open_memory (archive, msg->body->str, msg->body->len);
+	}
 
-	if (r != ARCHIVE_OK) {
-		msg_err ("Invalid archive");
-		rspamd_controller_send_error (conn_ent, 500, "Invalid archive");
+	if (archive == NULL || r != ARCHIVE_OK || msg->body->len == 0) {
+		msg_info ("invalid archive");
+		rspamd_controller_send_error (conn_ent, 500, "invalid archive");
+		return 0;
 	}
 
 	header = msg->headers;
 	while (header) {
-		header_name = g_strndup (header->name->str, header->name->len);
-		header_value = g_strndup (header->value->str, header->value->len);
+		if (header->name != NULL)
+			header_name = g_strndup (header->name->str, header->name->len);
+		if (header->value != NULL)
+			header_value = g_strndup (header->value->str, header->value->len);
 
 		if (g_strcmp0 (header_name, "X-ARCHIVE-NAME") == 0) {
-			archive_name = header_value;
+			archive_name = g_strdup (header_value);
 		} else if (g_strcmp0 (header_name, "X-MAXFILE-SIZE") == 0) {
 			maxsize = g_ascii_strtoll (header_value, NULL, 10);
 		} else if (g_strcmp0 (header_name, "X-FILTER-MASK") == 0) {
 			filter_mask = g_strsplit_set (header_value, " ,", -1);
+		} else if (g_strcmp0 (header_name, "X-ARCHIVE-MAXFILES") == 0) {
+			maxfiles = g_ascii_strtoll (header_value, NULL, 10);
 		}
+
 		header = header->next;
+
+		if (header_name)
+			g_free (header_name);
+		header_name = NULL;
+		if (header_value)
+			g_free (header_value);
+		header_value = NULL;
 	}
 
 	r = archive_read_next_header (archive, &entry);
@@ -197,30 +212,42 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 				size = archive_entry_size (entry);
 				pathname = archive_entry_pathname (entry);
 
-				for (guint i = 0; i < g_strv_length (filter_mask); i++) {
-					if (match_mask == FALSE) {
-						match_mask = g_pattern_match_simple (filter_mask[i], pathname);
-					} else {
-						break;
-					}
-				}
+				if (size > 0) {
+					curfile++;
 
-				if (match_mask == FALSE || (maxsize > 0 && size > maxsize)) {
-					r = archive_read_next_header (archive, &entry);
+					for (guint i = 0; i < g_strv_length (filter_mask); i++) {
+						if (match_mask == FALSE) {
+							match_mask = g_pattern_match_simple (filter_mask[i], pathname);
+						} else {
+							break;
+						}
+					}
+
+					if ((filter_mask != NULL && match_mask == FALSE) ||
+							(maxsize && (size > maxsize))) {
+						r = archive_read_next_header (archive, &entry);
+					} else {
+						match_mask = FALSE;
+						if (maxfiles && (curfile > maxfiles)) {
+							r = ARCHIVE_EOF;
+						} else {
+							buffer = g_malloc0 (size);
+							r = archive_read_data (archive, buffer, size);
+						}
+					}
 				} else {
-					buff = g_malloc0 (size);
-					r = archive_read_data (archive, buff, size);
+					r = archive_read_next_header (archive, &entry);
 				}
 			} break;
 			case ARCHIVE_WARN:
 			case ARCHIVE_FAILED:
 			case ARCHIVE_FATAL: {
 				errors++;
-				msg_err (archive_error_string (archive));
+				msg_info (archive_error_string (archive));
 				r = archive_read_next_header (archive, &entry);
 			} break;
 			default: {
-				hash = XXH32 (buff, size, 0);
+				hash = XXH32 (buffer, size, 0);
 
 				obj = ucl_object_typed_new (UCL_OBJECT);
 				ucl_object_insert_key (obj, ucl_object_fromstring (pathname), "pathname", 0, false);
@@ -231,9 +258,9 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 
 				r = archive_read_next_header (archive, &entry);
 
-				if (buff) {
-					g_free (buff);
-				}
+				if (buffer)
+					g_free (buffer);
+				buffer = NULL;
 			} break;
 		}
 	}
@@ -246,14 +273,16 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 		obj = ucl_object_typed_new (UCL_OBJECT);
 		ucl_object_insert_key (obj, ucl_object_fromstring (archive_name), "name", 0, false);
 		ucl_array_append (top, obj);
+		g_free (archive_name);
 	}
 
-	if (ucl_array_head (sub)) {
+	if (ucl_array_head (sub))
 		ucl_array_append (top, sub);
-	}
 
 	rspamd_controller_send_ucl (conn_ent, top);
 
+	if (filter_mask)
+		g_strfreev (filter_mask);
 	ucl_object_unref (top);
 	archive_read_free (archive);
 
