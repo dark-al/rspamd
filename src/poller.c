@@ -298,48 +298,113 @@ static int
 rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent,
 	struct rspamd_http_message *msg)
 {
-	struct archive *archive;
-	struct archive_entry *entry;
+	struct archive *archive = NULL;
+	struct archive_entry *entry = NULL;
+	struct rspamd_http_header *header = NULL;
 	int r;
-	unsigned int hash;
-	size_t size;
-	const char *pathname = NULL;
-	void *buff;
-	ucl_object_t *top, *obj;
+	unsigned int errors = 0, hash = 0, cur_hash = 0, maxsize = 0, offset = 0, curfile = 0, maxfiles = 0, ucl_size = 0;
+	size_t size = 0;
+	gchar *header_name = NULL, *header_value = NULL, *ucl_str = NULL;
+	gboolean match_mask = FALSE;
+	void *buffer = NULL;
+	ucl_object_t *top, *sub, *obj;
+	const ucl_object_t *cur;
+	struct ucl_parser *parser;
+  const gchar *error;
+	ucl_object_iter_t it = NULL;
 
-	top = ucl_object_typed_new (UCL_ARRAY);
+	parser = ucl_parser_new (UCL_PARSER_DEFAULT);
+  ucl_parser_add_string (parser, msg->body->str, msg->body->len);
 
-	archive = archive_read_new ();
-	archive_read_support_filter_all (archive);
-	archive_read_support_format_all (archive);
+  if ((error = ucl_parser_get_error (parser)) != NULL) {
+    msg_err ("cannot parse input: %s", error);
+    rspamd_controller_send_error (conn_ent, 400, "Cannot parse input");
+    ucl_parser_free (parser);
+    return 0;
+  }
 
-	r = archive_read_open_memory (archive, msg->body->str, msg->body->len);
+	top = ucl_parser_get_object (parser);
+  ucl_parser_free (parser);
 
-	if (r != ARCHIVE_OK) {
-		msg_err ("Invalid archive");
-		rspamd_controller_send_error (conn_ent, 500, "Invalid archive");
+	if (top->type != UCL_ARRAY || top->len != 2) {
+		msg_err ("input is not an array of 2 elements");
+		rspamd_controller_send_error (conn_ent, 400, "Cannot parse input");
+		ucl_object_unref (top);
+		return 0;
 	}
 
-	while (archive_read_next_header (archive, &entry) == ARCHIVE_OK) {
-		size = archive_entry_size (entry);
-		pathname = archive_entry_pathname (entry);
-		buff = malloc (size);
-		archive_read_data (archive, buff, size);
-		hash = XXH32 (buff, size, 0);
+	ucl_str = ucl_object_emit (top, UCL_EMIT_JSON_COMPACT);
+  ucl_size = g_utf8_strlen (ucl_str, -1);
 
-		obj = ucl_object_typed_new (UCL_OBJECT);
-		ucl_object_insert_key (obj, ucl_object_fromstring (pathname), "pathname", 0, false);
-		ucl_object_insert_key (obj, ucl_object_fromint (size), "size", 0, false);
-		ucl_object_insert_key (obj, ucl_object_fromint (hash), "hash", 0, false);
-		ucl_array_append (top, obj);
+	archive = archive_read_new ();
 
-		free (buff);
+	if (archive != NULL) {
+		archive_read_support_filter_all (archive);
+		archive_read_support_format_all (archive);
+		r = archive_read_open_memory (archive, msg->body->str, msg->body->len);
+	}
+
+	if (archive == NULL || r != ARCHIVE_OK || msg->body->len == 0) {
+		msg_info ("invalid archive");
+		rspamd_controller_send_error (conn_ent, 500, "invalid archive");
+		return 0;
+	}
+
+	r = archive_read_next_header (archive, &entry);
+	while (r != ARCHIVE_EOF) {
+		switch (r) {
+			case ARCHIVE_OK: {
+				if (archive_entry_filetype (entry) == AE_IFREG) {
+					size = archive_entry_size (entry);
+					buffer = g_malloc0 (size);
+					r = archive_read_data (archive, buffer, size);
+				} else {
+					r = archive_read_next_header (archive, &entry);
+				}
+			} break;
+			case ARCHIVE_WARN:
+			case ARCHIVE_FAILED:
+			case ARCHIVE_FATAL: {
+				errors++;
+				msg_info (archive_error_string (archive));
+				r = archive_read_next_header (archive, &entry);
+			} break;
+			default: {
+				// write to big buffer data
+
+				r = archive_read_next_header (archive, &entry);
+
+				if (buffer)
+					g_free (buffer);
+				buffer = NULL;
+			} break;
+	}
+
+	sub = ucl_array_find_index (top, 1);
+	for (guint i = 0; i < sub->len; i++) {
+		cur = ucl_iterate_object (sub, &it, TRUE);
+		if (cur == NULL) {
+			break;
+		}
+		size = ucl_obj_toint (ucl_object_find_key (cur, "size"));
+		hash = ucl_obj_toint (ucl_object_find_key (cur, "hash"));
+		offset = ucl_obj_toint (ucl_object_find_key (cur, "offset"));
+		buffer = g_malloc0 (size);
+		if (buffer != NULL) {
+			buffer = g_strndup (msg->body->str + ucl_size + offset, size);
+			cur_hash = XXH32 (buffer, size, 0);
+
+			if (cur_hash != hash) {
+				break;
+			}
+			rspamd_controller_send_string (conn_ent, buffer);
+			return 0;
+		}
 	}
 
 	rspamd_controller_send_ucl (conn_ent, top);
 
 	ucl_object_unref (top);
-	archive_read_free (archive);
 
 	return 0;
 }
