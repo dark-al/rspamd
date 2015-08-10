@@ -300,17 +300,15 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 {
 	struct archive *archive = NULL;
 	struct archive_entry *entry = NULL;
-	struct rspamd_http_header *header = NULL;
 	int r;
-	unsigned int errors = 0, hash = 0, cur_hash = 0, maxsize = 0, offset = 0, curfile = 0, maxfiles = 0, ucl_size = 0;
-	size_t size = 0;
-	gchar *header_name = NULL, *header_value = NULL, *ucl_str = NULL;
-	gboolean match_mask = FALSE;
-	void *buffer = NULL;
-	ucl_object_t *top, *sub, *obj;
-	const ucl_object_t *cur;
+	unsigned int errors = 0, hash = 0, cur_hash = 0, offset = 0, ucl_size = 0;
+	size_t size = 0, total_size = 0;
+	gchar *ucl_str = NULL;
+	void *buffer = NULL, *extracted = NULL;
+	ucl_object_t *top;
+	const ucl_object_t *sub, *cur;
 	struct ucl_parser *parser;
-  const gchar *error;
+  const gchar *error, *pathname;
 	ucl_object_iter_t it = NULL;
 
 	parser = ucl_parser_new (UCL_PARSER_DEFAULT);
@@ -355,9 +353,14 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 		switch (r) {
 			case ARCHIVE_OK: {
 				if (archive_entry_filetype (entry) == AE_IFREG) {
+					offset += size;
 					size = archive_entry_size (entry);
-					buffer = g_malloc0 (size);
-					r = archive_read_data (archive, buffer, size);
+					if (buffer == NULL) {
+						buffer = g_malloc0 (size);
+					} else {
+						buffer = g_realloc (buffer, offset + size);
+					}
+					r = archive_read_data (archive, (char *) buffer + offset, size);
 				} else {
 					r = archive_read_next_header (archive, &entry);
 				}
@@ -365,19 +368,13 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 			case ARCHIVE_WARN:
 			case ARCHIVE_FAILED:
 			case ARCHIVE_FATAL: {
-				errors++;
 				msg_info (archive_error_string (archive));
 				r = archive_read_next_header (archive, &entry);
 			} break;
 			default: {
-				// write to big buffer data
-
 				r = archive_read_next_header (archive, &entry);
-
-				if (buffer)
-					g_free (buffer);
-				buffer = NULL;
 			} break;
+		}
 	}
 
 	sub = ucl_array_find_index (top, 1);
@@ -386,25 +383,37 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 		if (cur == NULL) {
 			break;
 		}
+		pathname = ucl_object_tostring (ucl_object_find_key (cur, "pathname"));
 		size = ucl_obj_toint (ucl_object_find_key (cur, "size"));
 		hash = ucl_obj_toint (ucl_object_find_key (cur, "hash"));
 		offset = ucl_obj_toint (ucl_object_find_key (cur, "offset"));
-		buffer = g_malloc0 (size);
-		if (buffer != NULL) {
-			buffer = g_strndup (msg->body->str + ucl_size + offset, size);
-			cur_hash = XXH32 (buffer, size, 0);
 
-			if (cur_hash != hash) {
-				break;
+		cur_hash = XXH32 ((char *) buffer + offset, size, 0);
+		if (cur_hash == hash) {
+			total_size += size;
+
+			if (extracted == NULL) {
+				extracted = g_malloc0 (size);
+			} else {
+				extracted = g_realloc (extracted, total_size);
 			}
-			rspamd_controller_send_string (conn_ent, buffer);
-			return 0;
+
+			memcpy ((char *) extracted + total_size - size, (char *) buffer + offset, size);
+		} else {
+			errors++;
+			msg_info ("file %s has invalid hash %u", pathname, cur_hash);
 		}
 	}
 
-	rspamd_controller_send_ucl (conn_ent, top);
+	//rspamd_controller_send_ucl (conn_ent, top);
+	rspamd_controller_send_string (conn_ent, extracted);
 
 	ucl_object_unref (top);
+	archive_read_free (archive);
+	if (buffer)
+		g_free (buffer);
+	if (extracted)
+	 g_free (extracted);
 
 	return 0;
 }
