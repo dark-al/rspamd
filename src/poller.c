@@ -312,6 +312,7 @@ static int
 rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent,
 	struct rspamd_http_message *msg)
 {
+	struct rspamd_http_message *reply_msg;
 	struct archive *archive = NULL;
 	struct archive_entry *entry = NULL;
 	int r;
@@ -419,8 +420,21 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 		}
 	}
 
-	//rspamd_controller_send_ucl (conn_ent, top);
-	rspamd_controller_send_string (conn_ent, extracted);
+	reply_msg = rspamd_http_new_message (HTTP_RESPONSE);
+	rspamd_http_message_add_header (reply_msg, "X-UCL-SIZE", g_strdup_printf("%i", ucl_size));
+	reply_msg->date = time (NULL);
+	reply_msg->code = 200;
+	reply_msg->body = g_string_new (extracted);
+	rspamd_http_connection_reset (conn_ent->conn);
+	rspamd_http_connection_write_message (conn_ent->conn,
+		reply_msg,
+		NULL,
+		"application/json",
+		conn_ent,
+		conn_ent->conn->fd,
+		conn_ent->rt->ptv,
+		conn_ent->rt->ev_base);
+		conn_ent->is_reply = TRUE;
 
 	ucl_object_unref (top);
 	archive_read_free (archive);
