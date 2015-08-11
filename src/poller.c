@@ -60,6 +60,12 @@ struct rspamd_poller_worker_ctx {
 	struct rspamd_dns_resolver *resolver;
 	/* Events base */
 	struct event_base *ev_base;
+	/* Maximum file size*/
+	guint32 maxsize;
+	/* Maximum files */
+	guint32 maxfiles;
+	/* Filter mask */
+	gchar *filter_mask;
 	/* HTTP server */
 	struct rspamd_http_connection_router *http;
 	/* Server's start time */
@@ -148,6 +154,8 @@ static int
 rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	struct rspamd_http_message *msg)
 {
+	struct rspamd_poller_session *session = conn_ent->ud;
+	struct rspamd_poller_worker_ctx *ctx;
 	struct archive *archive = NULL;
 	struct archive_entry *entry = NULL;
 	struct rspamd_http_header *header = NULL;
@@ -159,6 +167,8 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	gboolean match_mask = FALSE;
 	void *buffer = NULL;
 	ucl_object_t *top, *sub, *obj;
+
+	ctx = session->ctx;
 
 	top = ucl_object_typed_new (UCL_ARRAY);
 	sub = ucl_object_typed_new (UCL_ARRAY);
@@ -176,6 +186,10 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 		rspamd_controller_send_error (conn_ent, 500, "invalid archive");
 		return 0;
 	}
+
+	maxsize = ctx->maxsize;
+	maxfiles = ctx->maxfiles;
+	filter_mask = g_strsplit_set (ctx->filter_mask, " ,", -1);
 
 	header = msg->headers;
 	while (header) {
@@ -422,14 +436,23 @@ gpointer
 init_poller_worker (struct rspamd_config *cfg)
 {
 	struct rspamd_poller_worker_ctx *ctx;
-	//GQuark type;
+	GQuark type;
 
-	/* FIXME: use type */
-	//type = g_quark_try_string ("poller");
+	type = g_quark_try_string ("poller");
 
 	ctx = g_malloc0 (sizeof (struct rspamd_poller_worker_ctx));
 
 	ctx->timeout = DEFAULT_WORKER_IO_TIMEOUT;
+
+	rspamd_rcl_register_worker_option (cfg, type, "maxsize",
+		rspamd_rcl_parse_struct_integer, ctx,
+		G_STRUCT_OFFSET (struct rspamd_poller_worker_ctx, maxsize), 0);
+	rspamd_rcl_register_worker_option (cfg, type, "maxfiles",
+		rspamd_rcl_parse_struct_integer, ctx,
+		G_STRUCT_OFFSET (struct rspamd_poller_worker_ctx, maxfiles), 0);
+	rspamd_rcl_register_worker_option (cfg, type, "filter_mask",
+		rspamd_rcl_parse_struct_string, ctx,
+		G_STRUCT_OFFSET (struct rspamd_poller_worker_ctx, filter_mask), 0);
 
 	return ctx;
 }
