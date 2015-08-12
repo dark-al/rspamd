@@ -318,8 +318,8 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 	int r;
 	unsigned int errors = 0, hash = 0, cur_hash = 0, offset = 0, ucl_size = 0;
 	size_t size = 0, total_size = 0;
-	gchar *ucl_str = NULL;
-	void *buffer = NULL, *extracted = NULL;
+	gchar *ucl_str = NULL, *extracted = NULL, *extracted_hex = NULL;
+	void *buffer = NULL;
 	ucl_object_t *top;
 	const ucl_object_t *sub, *cur;
 	struct ucl_parser *parser;
@@ -413,18 +413,25 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 				extracted = g_realloc (extracted, total_size);
 			}
 
-			memcpy ((char *) extracted + total_size - size, (char *) buffer + offset, size);
+			memcpy (extracted + total_size - size, (char *) buffer + offset, size);
 		} else {
 			errors++;
 			msg_info ("file %s has invalid hash %u", pathname, cur_hash);
 		}
 	}
 
+	extracted_hex = g_malloc (total_size * 2 + 1);
+	for (guint i = 0; i < total_size; i++) {
+				g_snprintf (extracted_hex + i * 2, 3, "%02x", (guint) (*((guint8 *) (extracted + i))));
+	}
+
 	reply_msg = rspamd_http_new_message (HTTP_RESPONSE);
 	rspamd_http_message_add_header (reply_msg, "X-UCL-SIZE", g_strdup_printf("%i", ucl_size));
 	reply_msg->date = time (NULL);
 	reply_msg->code = 200;
-	reply_msg->body = g_string_new (extracted);
+	reply_msg->body = g_string_sized_new (BUFSIZ);
+	rspamd_ucl_emit_gstring (top, UCL_EMIT_JSON_COMPACT, reply_msg->body);
+	g_string_append_printf (reply_msg->body, "%s\n", extracted_hex);
 	rspamd_http_connection_reset (conn_ent->conn);
 	rspamd_http_connection_write_message (conn_ent->conn,
 		reply_msg,
