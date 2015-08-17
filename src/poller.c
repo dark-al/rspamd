@@ -22,9 +22,13 @@
  */
 
 #include "config.h"
+#include "util.h"
+#include "main.h"
 #include "utlist.h"
 #include "main.h"
 #include "libutil/map.h"
+#include "libserver/worker_util.h"
+
 #include "xxhash.h"
 #include <archive.h>
 #include <archive_entry.h>
@@ -34,6 +38,8 @@
 
 #define PATH_ARCHIVEINFO "/archiveinfo"
 #define PATH_EXTRACTFILES "/extractfiles"
+
+extern struct rspamd_main *rspamd_main;
 
 /* Init functions */
 gpointer init_poller_worker (struct rspamd_config *cfg);
@@ -162,16 +168,13 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	int r;
 	unsigned int errors = 0, hash = 0, offset = 0, maxsize = 0, curfile = 0, maxfiles = 0;
 	size_t size = 0;
-	const char *pathname = NULL;
+	const char *pathname = NULL, *format = NULL;
 	gchar *header_name = NULL, *header_value = NULL, *archive_name = NULL, **filter_mask = NULL;
 	gboolean match_mask = FALSE;
 	void *buffer = NULL;
-	ucl_object_t *top, *sub, *obj;
+	ucl_object_t *top, *sub, *obj, *file_obj;
 
 	ctx = session->ctx;
-
-	top = ucl_object_typed_new (UCL_ARRAY);
-	sub = ucl_object_typed_new (UCL_ARRAY);
 
 	archive = archive_read_new ();
 
@@ -218,7 +221,11 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 		header_value = NULL;
 	}
 
+	top = ucl_object_typed_new (UCL_OBJECT);
+	sub = ucl_object_typed_new (UCL_ARRAY);
+
 	r = archive_read_next_header (archive, &entry);
+	format = archive_format_name (archive);
 	while (r != ARCHIVE_EOF) {
 		switch (r) {
 			case ARCHIVE_OK: {
@@ -264,11 +271,13 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 				hash = XXH32 (buffer, size, 0);
 
 				obj = ucl_object_typed_new (UCL_OBJECT);
-				ucl_object_insert_key (obj, ucl_object_fromstring (pathname), "pathname", 0, false);
 				ucl_object_insert_key (obj, ucl_object_fromint (size), "size", 0, false);
 				ucl_object_insert_key (obj, ucl_object_fromint (hash), "hash", 0, false);
 				ucl_object_insert_key (obj, ucl_object_fromint (offset), "offset", 0, false);
-				ucl_array_append (sub, obj);
+
+				file_obj = ucl_object_typed_new (UCL_OBJECT);
+				ucl_object_insert_key (file_obj, obj, g_strdup (pathname), 0, false);
+				ucl_array_append (sub, file_obj);
 
 				r = archive_read_next_header (archive, &entry);
 
@@ -279,19 +288,16 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 		}
 	}
 
-	obj = ucl_object_typed_new (UCL_OBJECT);
-	ucl_object_insert_key (obj, ucl_object_fromint (errors), "errors", 0, false);
-	ucl_array_append (top, obj);
-
+  obj = ucl_object_typed_new (UCL_OBJECT);
 	if (archive_name) {
-		obj = ucl_object_typed_new (UCL_OBJECT);
 		ucl_object_insert_key (obj, ucl_object_fromstring (archive_name), "name", 0, false);
-		ucl_array_append (top, obj);
 		g_free (archive_name);
 	}
-
+	ucl_object_insert_key (obj, ucl_object_fromstring (format), "format", 0, false);
+	ucl_object_insert_key (obj, ucl_object_fromint (errors), "errors", 0, false);
 	if (ucl_array_head (sub))
-		ucl_array_append (top, sub);
+		ucl_object_insert_key (obj, sub, "files", 0, false);
+	ucl_object_insert_key (top, obj, "archive", 0, false);
 
 	rspamd_controller_send_ucl (conn_ent, top);
 
@@ -318,13 +324,12 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 	int r;
 	unsigned int errors = 0, hash = 0, cur_hash = 0, offset = 0, ucl_size = 0;
 	size_t size = 0, total_size = 0;
-	gchar *ucl_str = NULL, *extracted = NULL, *extracted_hex = NULL;
-	void *buffer = NULL;
+	gchar *ucl_str = NULL, *buffer = NULL, *buffer_hex = NULL;
 	ucl_object_t *top;
-	const ucl_object_t *sub, *cur;
+	const ucl_object_t *sub, *cur, *keys;
 	struct ucl_parser *parser;
-  const gchar *error, *pathname;
-	ucl_object_iter_t it = NULL;
+  const gchar *error, *pathname, *cur_pathname;
+	ucl_object_iter_t iter = NULL;
 
 	parser = ucl_parser_new (UCL_PARSER_DEFAULT);
   ucl_parser_add_string (parser, msg->body->str, msg->body->len);
@@ -339,8 +344,9 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 	top = ucl_parser_get_object (parser);
   ucl_parser_free (parser);
 
-	if (top->type != UCL_ARRAY || top->len != 2) {
-		msg_err ("input is not an array of 2 elements");
+	sub = ucl_object_find_key (top, "archive");
+	if (top->type != UCL_OBJECT || sub == NULL) {
+		msg_err ("input is not a valid data");
 		rspamd_controller_send_error (conn_ent, 400, "Cannot parse input");
 		ucl_object_unref (top);
 		return 0;
@@ -349,80 +355,73 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 	ucl_str = ucl_object_emit (top, UCL_EMIT_JSON_COMPACT);
   ucl_size = g_utf8_strlen (ucl_str, -1);
 
-	archive = archive_read_new ();
+	sub = ucl_object_find_key (sub, "files");
+	while ((cur = ucl_iterate_object (sub, &iter, true))) {
+		ucl_object_iter_t keys_iter = NULL;
 
-	if (archive != NULL) {
-		archive_read_support_filter_all (archive);
-		archive_read_support_format_all (archive);
-		r = archive_read_open_memory (archive, msg->body->str, msg->body->len);
-	}
+		if (cur->type != UCL_OBJECT) {
+			msg_err ("json array data error");
+			rspamd_controller_send_error (conn_ent, 400, "Cannot parse input");
+			ucl_object_unref (top);
+			return 0;
+		}
+		keys = ucl_iterate_object (cur, &keys_iter, true);
+		pathname = ucl_copy_key_trash (keys);
+		size = ucl_obj_toint (ucl_object_find_key (keys, "size"));
+		hash = ucl_obj_toint (ucl_object_find_key (keys, "hash"));
+		offset = ucl_obj_toint (ucl_object_find_key (keys, "offset"));
 
-	if (archive == NULL || r != ARCHIVE_OK || msg->body->len == 0) {
-		msg_info ("invalid archive");
-		rspamd_controller_send_error (conn_ent, 500, "invalid archive");
-		return 0;
-	}
+		archive = archive_read_new ();
 
-	r = archive_read_next_header (archive, &entry);
-	while (r != ARCHIVE_EOF) {
-		switch (r) {
-			case ARCHIVE_OK: {
-				if (archive_entry_filetype (entry) == AE_IFREG) {
-					offset += size;
-					size = archive_entry_size (entry);
-					if (buffer == NULL) {
-						buffer = g_malloc0 (size);
+		if (archive != NULL) {
+			archive_read_support_filter_all (archive);
+			archive_read_support_format_all (archive);
+			r = archive_read_open_memory (archive, msg->body->str, msg->body->len);
+		}
+
+		if (archive == NULL || r != ARCHIVE_OK) {
+			msg_info ("invalid archive");
+			rspamd_controller_send_error (conn_ent, 500, "invalid archive");
+			return 0;
+		}
+
+		r = archive_read_next_header (archive, &entry);
+		while (r != ARCHIVE_EOF) {
+			switch (r) {
+				case ARCHIVE_OK: {
+					cur_pathname = archive_entry_pathname (entry);
+					if (g_strcmp0 (pathname, cur_pathname) == 0 &&
+							archive_entry_filetype (entry) == AE_IFREG) {
+						total_size += size;
+						if (buffer == NULL) {
+							buffer = g_malloc0 (size);
+						} else {
+							buffer = g_realloc (buffer, total_size);
+						}
+						r = archive_read_data (archive, buffer + total_size - size, size);
 					} else {
-						buffer = g_realloc (buffer, offset + size);
+						r = archive_read_next_header (archive, &entry);
 					}
-					r = archive_read_data (archive, (char *) buffer + offset, size);
-				} else {
+				} break;
+				case ARCHIVE_WARN:
+				case ARCHIVE_FAILED: {
+					errors++;
+					msg_info (archive_error_string (archive));
 					r = archive_read_next_header (archive, &entry);
-				}
-			} break;
-			case ARCHIVE_WARN:
-			case ARCHIVE_FAILED:
-			case ARCHIVE_FATAL: {
-				msg_info (archive_error_string (archive));
-				r = archive_read_next_header (archive, &entry);
-			} break;
-			default: {
-				r = archive_read_next_header (archive, &entry);
-			} break;
-		}
-	}
-
-	sub = ucl_array_find_index (top, 1);
-	for (guint i = 0; i < sub->len; i++) {
-		cur = ucl_iterate_object (sub, &it, TRUE);
-		if (cur == NULL) {
-			break;
-		}
-		pathname = ucl_object_tostring (ucl_object_find_key (cur, "pathname"));
-		size = ucl_obj_toint (ucl_object_find_key (cur, "size"));
-		hash = ucl_obj_toint (ucl_object_find_key (cur, "hash"));
-		offset = ucl_obj_toint (ucl_object_find_key (cur, "offset"));
-
-		cur_hash = XXH32 ((char *) buffer + offset, size, 0);
-		if (cur_hash == hash) {
-			total_size += size;
-
-			if (extracted == NULL) {
-				extracted = g_malloc0 (size);
-			} else {
-				extracted = g_realloc (extracted, total_size);
+				} break;
+				case ARCHIVE_FATAL:
+				default: {
+					r = ARCHIVE_EOF;
+				} break;
 			}
-
-			memcpy (extracted + total_size - size, (char *) buffer + offset, size);
-		} else {
-			errors++;
-			msg_info ("file %s has invalid hash %u", pathname, cur_hash);
 		}
+
+		archive_read_free (archive);
 	}
 
-	extracted_hex = g_malloc (total_size * 2 + 1);
+	buffer_hex = g_malloc (total_size * 2 + 1);
 	for (guint i = 0; i < total_size; i++) {
-				g_snprintf (extracted_hex + i * 2, 3, "%02x", (guint) (*((guint8 *) (extracted + i))));
+		g_snprintf (buffer_hex + i * 2, 3, "%02x", (guint) (*((guint8 *) (buffer + i))));
 	}
 
 	reply_msg = rspamd_http_new_message (HTTP_RESPONSE);
@@ -431,7 +430,7 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 	reply_msg->code = 200;
 	reply_msg->body = g_string_sized_new (BUFSIZ);
 	rspamd_ucl_emit_gstring (top, UCL_EMIT_JSON_COMPACT, reply_msg->body);
-	g_string_append_printf (reply_msg->body, "%s\n", extracted_hex);
+	g_string_append (reply_msg->body, buffer_hex);
 	rspamd_http_connection_reset (conn_ent->conn);
 	rspamd_http_connection_write_message (conn_ent->conn,
 		reply_msg,
@@ -444,11 +443,10 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 		conn_ent->is_reply = TRUE;
 
 	ucl_object_unref (top);
-	archive_read_free (archive);
 	if (buffer)
 		g_free (buffer);
-	if (extracted)
-	 g_free (extracted);
+	if (buffer_hex)
+	 g_free (buffer_hex);
 
 	return 0;
 }
