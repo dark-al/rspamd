@@ -325,11 +325,11 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 	unsigned int errors = 0, hash = 0, cur_hash = 0, offset = 0, ucl_size = 0;
 	size_t size = 0, total_size = 0;
 	gchar *ucl_str = NULL, *buffer = NULL, *buffer_hex = NULL;
-	ucl_object_t *top;
-	const ucl_object_t *sub, *cur, *keys;
+	ucl_object_t *top, *sub, *cur, *files_obj, *keys_obj;
 	struct ucl_parser *parser;
   const gchar *error, *pathname, *cur_pathname;
 	ucl_object_iter_t iter = NULL;
+	gboolean pathname_equal = FALSE;
 
 	parser = ucl_parser_new (UCL_PARSER_DEFAULT);
   ucl_parser_add_string (parser, msg->body->str, msg->body->len);
@@ -344,7 +344,7 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 	top = ucl_parser_get_object (parser);
   ucl_parser_free (parser);
 
-	sub = ucl_object_find_key (top, "archive");
+	sub = (ucl_object_t *) ucl_object_find_key (top, "archive");
 	if (top->type != UCL_OBJECT || sub == NULL) {
 		msg_err ("input is not a valid data");
 		rspamd_controller_send_error (conn_ent, 400, "Cannot parse input");
@@ -352,24 +352,21 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 		return 0;
 	}
 
-	ucl_str = ucl_object_emit (top, UCL_EMIT_JSON_COMPACT);
-  ucl_size = g_utf8_strlen (ucl_str, -1);
-
-	sub = ucl_object_find_key (sub, "files");
-	while ((cur = ucl_iterate_object (sub, &iter, true))) {
+	files_obj = (ucl_object_t *) ucl_object_find_key (sub, "files");
+	while ((cur = (ucl_object_t *) ucl_iterate_object (files_obj, &iter, true))) {
 		ucl_object_iter_t keys_iter = NULL;
-
 		if (cur->type != UCL_OBJECT) {
 			msg_err ("json array data error");
 			rspamd_controller_send_error (conn_ent, 400, "Cannot parse input");
 			ucl_object_unref (top);
 			return 0;
 		}
-		keys = ucl_iterate_object (cur, &keys_iter, true);
-		pathname = ucl_copy_key_trash (keys);
-		size = ucl_obj_toint (ucl_object_find_key (keys, "size"));
-		hash = ucl_obj_toint (ucl_object_find_key (keys, "hash"));
-		offset = ucl_obj_toint (ucl_object_find_key (keys, "offset"));
+
+		keys_obj = (ucl_object_t *) ucl_iterate_object (cur, &keys_iter, true);
+		pathname = ucl_copy_key_trash (keys_obj);
+		pathname_equal = FALSE;
+		size = ucl_obj_toint (ucl_object_find_key (keys_obj, "size"));
+		hash = ucl_obj_toint (ucl_object_find_key (keys_obj, "hash"));
 
 		archive = archive_read_new ();
 
@@ -392,13 +389,17 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 					cur_pathname = archive_entry_pathname (entry);
 					if (g_strcmp0 (pathname, cur_pathname) == 0 &&
 							archive_entry_filetype (entry) == AE_IFREG) {
+						pathname_equal = TRUE;
 						total_size += size;
+						offset = total_size - size;
 						if (buffer == NULL) {
 							buffer = g_malloc0 (size);
 						} else {
 							buffer = g_realloc (buffer, total_size);
 						}
-						r = archive_read_data (archive, buffer + total_size - size, size);
+						r = archive_read_data (archive, buffer + offset, size);
+						/* update offset in ucl */
+						ucl_object_replace_key (keys_obj, ucl_object_fromint (offset), "offset", 0, false);
 					} else {
 						r = archive_read_next_header (archive, &entry);
 					}
@@ -416,20 +417,33 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 			}
 		}
 
+		if (!pathname_equal) {
+			ucl_array_delete (files_obj, cur);
+		}
 		archive_read_free (archive);
 	}
 
+	/* convert buffer to hex */
 	buffer_hex = g_malloc (total_size * 2 + 1);
 	for (guint i = 0; i < total_size; i++) {
 		g_snprintf (buffer_hex + i * 2, 3, "%02x", (guint) (*((guint8 *) (buffer + i))));
 	}
 
+	/* update errors in ucl */
+	ucl_object_replace_key (sub, ucl_object_fromint (errors), "errors", 0, false);
+
+	/* delete files key in ucl */
+	if (ucl_array_head (files_obj) == NULL)
+		ucl_object_delete_key (sub, "files");
+
+	ucl_str = ucl_object_emit (top, UCL_EMIT_JSON_COMPACT);
+	ucl_size = g_utf8_strlen (ucl_str, -1);
+
 	reply_msg = rspamd_http_new_message (HTTP_RESPONSE);
 	rspamd_http_message_add_header (reply_msg, "X-UCL-SIZE", g_strdup_printf("%i", ucl_size));
 	reply_msg->date = time (NULL);
 	reply_msg->code = 200;
-	reply_msg->body = g_string_sized_new (BUFSIZ);
-	rspamd_ucl_emit_gstring (top, UCL_EMIT_JSON_COMPACT, reply_msg->body);
+	reply_msg->body = g_string_new (ucl_str);
 	g_string_append (reply_msg->body, buffer_hex);
 	rspamd_http_connection_reset (conn_ent->conn);
 	rspamd_http_connection_write_message (conn_ent->conn,
