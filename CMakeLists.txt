@@ -29,7 +29,7 @@ SET_PROPERTY(GLOBAL PROPERTY ALLOW_DUPLICATE_CUSTOM_TARGETS 1)
 
 ############################# OPTIONS SECTION #############################################
 
-OPTION(DEBUG_MODE          "Enable debug output [default: OFF]"                 OFF)
+OPTION(DEBUG_MODE          "Enable debug output [default: OFF]"                 ON)
 OPTION(ENABLE_OPTIMIZATION "Enable extra optimizations [default: OFF]"          OFF)
 OPTION(SKIP_RELINK_RPATH   "Skip relinking and full RPATH for the install tree" OFF)
 OPTION(ENABLE_REDIRECTOR   "Enable redirector install [default: OFF]"           OFF)
