@@ -39,6 +39,11 @@
 #define PATH_ARCHIVEINFO "/archiveinfo"
 #define PATH_EXTRACTFILES "/extractfiles"
 
+#define ARCHIVE_NAME_HEADER "X-ARCHIVE-NAME"
+#define ARCHIVE_MAXFILES_HEADER "X-ARCHIVE-MAXFILES"
+#define MAXFILE_SIZE_HEADER "X-MAXFILE-SIZE"
+#define FILTER_MASK_HEADER "X-FILTER-MASK"
+
 extern struct rspamd_main *rspamd_main;
 
 /* Init functions */
@@ -166,18 +171,19 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 	struct archive_entry *entry = NULL;
 	struct rspamd_http_header *header = NULL;
 	int r;
-	unsigned int errors = 0, hash = 0, offset = 0, maxsize = 0, curfile = 0, maxfiles = 0;
-	size_t size = 0;
-	const char *pathname = NULL, *format = NULL;
-	gchar *header_name = NULL, *header_value = NULL, *archive_name = NULL, **filter_mask = NULL;
-	gboolean match_mask = FALSE;
+	gsize size;
+	guint errors = 0, hash = 0, curfile = 0, maxfiles, maxsize;
+	gchar *archive_name = NULL, **filter_mask = NULL;
+	const gchar *pathname = NULL, *format = NULL;
 	void *buffer = NULL;
 	ucl_object_t *top, *sub, *obj, *file_obj;
 
 	ctx = session->ctx;
 
-	archive = archive_read_new ();
+	top = ucl_object_typed_new (UCL_OBJECT);
+	sub = ucl_object_typed_new (UCL_ARRAY);
 
+	archive = archive_read_new ();
 	if (archive != NULL) {
 		archive_read_support_filter_all (archive);
 		archive_read_support_format_all (archive);
@@ -190,28 +196,31 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 		return 0;
 	}
 
+	/* get options from config */
 	maxsize = ctx->maxsize;
 	maxfiles = ctx->maxfiles;
 	filter_mask = g_strsplit_set (ctx->filter_mask, " ,", -1);
 
-	header = msg->headers;
-	while (header) {
-		if (header->name != NULL)
+	/* get options from headers */
+	LL_FOREACH (msg->headers, header) {
+		gchar *header_name = NULL, *header_value = NULL;
+
+		if (header->name)
 			header_name = g_strndup (header->name->str, header->name->len);
-		if (header->value != NULL)
+		if (header->value)
 			header_value = g_strndup (header->value->str, header->value->len);
 
-		if (g_strcmp0 (header_name, "X-ARCHIVE-NAME") == 0) {
+		if (g_strcmp0 (header_name, ARCHIVE_NAME_HEADER) == 0) {
 			archive_name = g_strdup (header_value);
-		} else if (g_strcmp0 (header_name, "X-MAXFILE-SIZE") == 0) {
-			maxsize = g_ascii_strtoll (header_value, NULL, 10);
-		} else if (g_strcmp0 (header_name, "X-FILTER-MASK") == 0) {
-			filter_mask = g_strsplit_set (header_value, " ,", -1);
-		} else if (g_strcmp0 (header_name, "X-ARCHIVE-MAXFILES") == 0) {
+		} else if (g_strcmp0 (header_name, ARCHIVE_MAXFILES_HEADER) == 0) {
 			maxfiles = g_ascii_strtoll (header_value, NULL, 10);
+		} else if (g_strcmp0 (header_name, MAXFILE_SIZE_HEADER) == 0) {
+			maxsize = g_ascii_strtoll (header_value, NULL, 10);
+		} else if (g_strcmp0 (header_name, FILTER_MASK_HEADER) == 0) {
+			if (filter_mask)
+				g_strfreev (filter_mask);
+			filter_mask = g_strsplit_set (header_value, " ,", -1);
 		}
-
-		header = header->next;
 
 		if (header_name)
 			g_free (header_name);
@@ -221,21 +230,21 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 		header_value = NULL;
 	}
 
-	top = ucl_object_typed_new (UCL_OBJECT);
-	sub = ucl_object_typed_new (UCL_ARRAY);
-
 	r = archive_read_next_header (archive, &entry);
 	format = archive_format_name (archive);
 	while (r != ARCHIVE_EOF) {
 		switch (r) {
 			case ARCHIVE_OK: {
-				offset += size;
+				gboolean match_mask = FALSE;
+
 				size = archive_entry_size (entry);
 				pathname = archive_entry_pathname (entry);
 
+				/* handle file, else skip entry */
 				if (archive_entry_filetype (entry) == AE_IFREG) {
 					curfile++;
 
+					/* check if filter mask match */
 					for (guint i = 0; i < g_strv_length (filter_mask); i++) {
 						if (match_mask == FALSE) {
 							match_mask = g_pattern_match_simple (filter_mask[i], pathname);
@@ -244,17 +253,16 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 						}
 					}
 
+					/* skip entry if mask not match or size large that allowed */
 					if ((filter_mask != NULL && match_mask == FALSE) ||
 							(maxsize && (size > maxsize))) {
 						r = archive_read_next_header (archive, &entry);
+					/* finish handle archive if reached maxfiles */
+					} else if (maxfiles && (curfile > maxfiles)) {
+						r = ARCHIVE_EOF;
 					} else {
-						match_mask = FALSE;
-						if (maxfiles && (curfile > maxfiles)) {
-							r = ARCHIVE_EOF;
-						} else {
-							buffer = g_malloc0 (size);
-							r = archive_read_data (archive, buffer, size);
-						}
+						buffer = g_malloc0 (size);
+						r = archive_read_data (archive, buffer, size);
 					}
 				} else {
 					r = archive_read_next_header (archive, &entry);
@@ -273,7 +281,6 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 				obj = ucl_object_typed_new (UCL_OBJECT);
 				ucl_object_insert_key (obj, ucl_object_fromint (size), "size", 0, false);
 				ucl_object_insert_key (obj, ucl_object_fromint (hash), "hash", 0, false);
-				ucl_object_insert_key (obj, ucl_object_fromint (offset), "offset", 0, false);
 
 				file_obj = ucl_object_typed_new (UCL_OBJECT);
 				ucl_object_insert_key (file_obj, obj, g_strdup (pathname), 0, false);
