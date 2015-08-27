@@ -328,15 +328,19 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 	struct rspamd_http_message *reply_msg;
 	struct archive *archive = NULL;
 	struct archive_entry *entry = NULL;
+	struct ucl_parser *parser;
 	int r;
-	unsigned int errors = 0, hash = 0, cur_hash = 0, offset = 0, ucl_size = 0;
-	size_t size = 0, total_size = 0;
+	gsize size = 0, total_size = 0;
+	guint errors = 0, hash = 0, curhash = 0, offset = 0, ucl_size = 0;
 	gchar *ucl_str = NULL, *buffer = NULL, *buffer_hex = NULL, *buffer_tmp = NULL;
 	ucl_object_t *top, *sub, *cur, *files_obj, *keys_obj;
-	struct ucl_parser *parser;
-  const gchar *error, *pathname, *cur_pathname;
 	ucl_object_iter_t iter = NULL;
-	gboolean pathname_equal = FALSE;
+
+	gchar *archive_name = NULL, **filter_mask = NULL;
+	const gchar *pathname = NULL, *format = NULL;
+	void *buffer = NULL;
+	ucl_object_t *top, *sub, *obj, *file_obj;
+
 
 	parser = ucl_parser_new (UCL_PARSER_DEFAULT);
   ucl_parser_add_string (parser, msg->body->str, msg->body->len);
