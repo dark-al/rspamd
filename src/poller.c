@@ -244,22 +244,28 @@ rspamd_poller_handle_archiveinfo (struct rspamd_http_connection_entry *conn_ent,
 				if (archive_entry_filetype (entry) == AE_IFREG) {
 					curfile++;
 
-					/* check if filter mask match */
-					for (guint i = 0; i < g_strv_length (filter_mask); i++) {
-						if (match_mask == FALSE) {
-							match_mask = g_pattern_match_simple (filter_mask[i], pathname);
-						} else {
-							break;
-						}
-					}
-
 					/* finish handle archive if reached maxfiles */
 					if (maxfiles && (curfile > maxfiles)) {
 						msg_debug ("finish handle archive, reached maximum files: %d", maxfiles);
 						r = ARCHIVE_EOF;
 					} else {
+						/* check if pathname not empty */
+						if (g_utf8_strlen (pathname, -1) == 0) {
+							errors++;
+							msg_err ("file with empty pathname");
+						}
+
+						/* check if filter mask match */
+						if (filter_mask) {
+							for (guint i = 0; i < g_strv_length (filter_mask); i++) {
+								match_mask = g_pattern_match_simple (filter_mask[i], g_utf8_casefold (pathname, -1));
+								if (match_mask)
+									break;
+							}
+						}
+
 						/* skip entry if mask not match */
-						if (filter_mask != NULL && match_mask == FALSE) {
+						if (filter_mask != NULL && !match_mask) {
 							msg_debug ("skipping file: %s: filter mask doesn't match", pathname);
 							r = archive_read_next_header (archive, &entry);
 						/* skip entry if size large that allowed */
@@ -366,6 +372,9 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 		return 0;
 	}
 
+	ucl_str = ucl_object_emit (top, UCL_EMIT_JSON_COMPACT);
+	ucl_size = g_utf8_strlen (ucl_str, -1);
+
 	files_obj = (ucl_object_t *) ucl_object_find_key (sub, "files");
 	while ((cur = (ucl_object_t *) ucl_iterate_object (files_obj, &iter, true))) {
 		ucl_object_iter_t keys_iter = NULL;
@@ -386,7 +395,7 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 		if (archive != NULL) {
 			archive_read_support_filter_all (archive);
 			archive_read_support_format_all (archive);
-			r = archive_read_open_memory (archive, msg->body->str, msg->body->len);
+			r = archive_read_open_memory (archive, msg->body->str + ucl_size, msg->body->len - ucl_size);
 		}
 
 		if (archive == NULL || r != ARCHIVE_OK) {
@@ -400,7 +409,7 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 			switch (r) {
 				case ARCHIVE_OK: {
 					cur_pathname = archive_entry_pathname (entry);
-					if (g_strcmp0 (pathname, cur_pathname) == 0 &&
+					if (g_strcmp0 (g_utf8_casefold (pathname, -1), cur_pathname) == 0 &&
 							archive_entry_filetype (entry) == AE_IFREG) {
 						pathname_equal = TRUE;
 						size = ucl_obj_toint (ucl_object_find_key (keys_obj, "size"));
@@ -425,7 +434,8 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 							ucl_object_replace_key (keys_obj, ucl_object_fromint (offset), "offset", 0, false);
 						} else {
 							/* mark object with bad hash */
-							msg_debug ("skipping file: %s: bad hash", pathname);
+							errors++;
+							msg_err ("skipping file: %s: bad hash", pathname);
 							ucl_object_replace_key (keys_obj, ucl_object_fromint (0), "hash", 0, false);
 						}
 
@@ -450,7 +460,8 @@ rspamd_poller_handle_extractfiles (struct rspamd_http_connection_entry *conn_ent
 
 		if (!pathname_equal) {
 			/* mark object as empty */
-			msg_debug ("archive doesn't contain file: %s", pathname);
+			errors++;
+			msg_err ("archive doesn't contain file: %s", pathname);
 			ucl_object_replace_key (keys_obj, ucl_object_fromint (0), "size", 0, false);
 		}
 		archive_read_free (archive);
