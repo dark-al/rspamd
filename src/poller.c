@@ -148,7 +148,7 @@ rspamd_poller_accept_socket (gint fd, short what, void *arg)
 	}
 
 	nsession = g_slice_alloc0 (sizeof (struct rspamd_poller_session));
-	nsession->pool = rspamd_mempool_new (rspamd_mempool_suggest_size ());
+	nsession->pool = rspamd_mempool_new (rspamd_mempool_suggest_size (), NULL);
 	nsession->ctx = ctx;
 
 	nsession->from_addr = addr;
